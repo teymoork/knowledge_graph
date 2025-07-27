@@ -1,0 +1,22 @@
+[tool.poetry]
+name = "knowledge-graph"
+version = "0.1.0"
+description = ""
+authors = ["Teymoor <teymoor.k@gmail.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.12"
+openai = "^1.97.1"
+langchain = "^0.3.27"
+neo4j = "^5.28.1"
+python-dotenv = "^1.1.1"
+tqdm = "^4.67.1"
+google-generativeai = "^0.8.5"
+pymupdf = "^1.26.3"
+ijson = "^3.4.0"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

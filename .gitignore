@@ -1,0 +1,42 @@
+#Python artifacts
+pycache/
+*.pyc
+*.pyo
+*.pyd
+#Virtual Environment
+.venv/
+venv/
+env/
+Secrets
+
+# Secrets
+# This is critical to prevent API keys from being committed.
+.env
+*.env
+
+# Data Files
+# We typically don't commit large data files or generated outputs.
+*.json
+*.csv
+*.db
+*.sqlite3
+/data/book.txt
+/data/extracted_graph.json
+/data/progress_stats.json
+/data/schema_suggestions.json
+
+# IDE / Editor specific
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Temporary and one-off scripts
+check_file.py
+clean_file.py
+convert_pdfs.py
+discover_schema.py
