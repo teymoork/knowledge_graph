@@ -1,111 +1,147 @@
+import os
+import sys
+import json
 import ijson
 from neo4j import GraphDatabase
+from dotenv import load_dotenv
 from tqdm import tqdm
-import config
-from graph_schema import NodeLabel, RelationshipLabel, POSSIBLE_RELATIONSHIPS
+
+# --- Sibling Import Fix ---
+from graph_schema import BASE_NODE_LABELS, EVENT_HIERARCHY, CONCEPT_HIERARCHY
 
 # --- Configuration ---
-GRAPH_JSON_PATH = "data/extracted_graph.json"
-BATCH_SIZE = 1000  # Process 1000 triplets per transaction for better performance
+load_dotenv()
+NEO4J_URI = os.getenv("NEO4J_URI")
+NEO4J_USER = os.getenv("NEO4J_USER")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+JSON_FILE_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'extracted_graph.json')
 
-# Create a mapping from relationship labels to the expected node labels for head and tail
-RELATIONSHIP_TO_NODE_LABELS = {}
-for head_label, rel_label, tail_label in POSSIBLE_RELATIONSHIPS:
-    RELATIONSHIP_TO_NODE_LABELS[rel_label.value] = {
-        "head": head_label.value,
-        "tail": tail_label.value
-    }
+# --- Helper Functions ---
+def get_all_labels(primary_label: str) -> list[str]:
+    """Traverses the hierarchy dictionaries to find all parent labels."""
+    if not primary_label or not isinstance(primary_label, str):
+        return []
+    labels = [primary_label]
+    current_label = primary_label
+    full_hierarchy = {**EVENT_HIERARCHY, **CONCEPT_HIERARCHY}
+    while current_label in full_hierarchy:
+        parent_label = full_hierarchy[current_label]
+        labels.append(parent_label)
+        current_label = parent_label
+    return labels
 
-def get_node_labels(relation: str) -> tuple[str, str] | None:
-    """Looks up the correct node labels for a given relationship."""
-    rule = RELATIONSHIP_TO_NODE_LABELS.get(relation)
-    if not rule:
-        return None
-    return rule["head"], rule["tail"]
-
-def main():
+def flatten_properties(props):
     """
-    Populates the Neo4j database from the extracted_graph.json file.
+    Recursively flattens property values. Converts any dict or list
+    found as a value into a JSON string.
     """
-    print("--- Starting Neo4j Database Population ---")
+    if not isinstance(props, dict):
+        return props
     
+    flat_props = {}
+    for key, value in props.items():
+        if isinstance(value, (dict, list)):
+            flat_props[key] = json.dumps(value, ensure_ascii=False)
+        else:
+            flat_props[key] = value
+    return flat_props
+
+# --- Neo4j Operations ---
+def create_constraints(tx):
+    """Ensures uniqueness constraints are created for all base node types."""
+    print("Ensuring uniqueness constraints exist...")
+    for label in BASE_NODE_LABELS:
+        query = f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:{label}) REQUIRE n.name IS UNIQUE"
+        tx.run(query)
+    print("Constraints checked.")
+
+def populate_graph():
+    """Streams the JSON file and populates the Neo4j database with the most robust query pattern."""
+    print("Connecting to Neo4j database...")
+    driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+    driver.verify_connectivity()
+    print("Connection successful.")
+
+    with driver.session(database="neo4j") as session:
+        session.execute_write(create_constraints)
+
+    cypher_query = """
+    UNWIND $batch as row
+    MERGE (head {name: row.head_name})
+    MERGE (tail {name: row.tail_name})
+    WITH head, tail, row
+    CALL apoc.create.addLabels(head, row.head_labels) YIELD node AS head_labeled
+    CALL apoc.create.addLabels(tail, row.tail_labels) YIELD node AS tail_labeled
+    CALL apoc.merge.relationship(head_labeled, row.rel_type, {}, row.rel_props, tail_labeled) YIELD rel
+    RETURN count(*) as processed_count
+    """
+
+    processed_count = 0
+    skipped_count = 0
+    batch = []
+    batch_size = 500
+
+    print(f"Starting to process {JSON_FILE_PATH}...")
     try:
-        driver = GraphDatabase.driver(
-            config.NEO4J_URI, 
-            auth=(config.NEO4J_USER, config.NEO4J_PASSWORD)
-        )
-        driver.verify_connectivity()
-        print("Successfully connected to Neo4j database.")
-    except Exception as e:
-        print(f"Error: Could not connect to Neo4j. Please ensure the database is running. Details: {e}")
-        return
-
-    with driver.session() as session:
-        print("Ensuring database constraints exist...")
-        for label in NodeLabel:
-            session.run(f"CREATE CONSTRAINT IF NOT EXISTS FOR (n:`{label.value}`) REQUIRE n.name IS UNIQUE")
-        print("Constraints are in place.")
-
-        triplets_batch = []
-        processed_count = 0
-
-        print(f"Streaming and processing triplets from {GRAPH_JSON_PATH}...")
-        try:
-            with open(GRAPH_JSON_PATH, 'rb') as f:
-                # --- CORRECTED LINE ---
-                # Look for items under the 'graph' key at the root, then iterate its items.
-                json_stream = ijson.items(f, 'graph.item')
-                
-                for triplet in tqdm(json_stream, desc="Populating database"):
-                    if not all(key in triplet for key in ["head", "relation", "tail"]):
-                        tqdm.write(f"Skipping malformed triplet: {triplet}")
+        with open(JSON_FILE_PATH, 'r', encoding='utf-8') as f:
+            relationships = ijson.items(f, 'graph.item')
+            
+            with driver.session(database="neo4j") as session:
+                for rel in tqdm(relationships, desc="Populating Graph"):
+                    required_keys = ['head', 'head_label', 'relation', 'tail', 'tail_label', 'properties']
+                    if not all(k in rel for k in required_keys):
+                        skipped_count += 1
                         continue
                     
-                    triplets_batch.append(triplet)
+                    head_label = rel.get('head_label')
+                    tail_label = rel.get('tail_label')
+                    head_name = rel.get('head')
+                    tail_name = rel.get('tail')
+                    relation = rel.get('relation')
 
-                    if len(triplets_batch) >= BATCH_SIZE:
-                        process_batch(session, triplets_batch)
-                        processed_count += len(triplets_batch)
-                        triplets_batch = []
+                    if not all([
+                        isinstance(head_label, str) and head_label.strip(),
+                        isinstance(tail_label, str) and tail_label.strip(),
+                        isinstance(head_name, str) and head_name.strip(),
+                        isinstance(tail_name, str) and tail_name.strip(),
+                        isinstance(relation, str) and relation.strip()
+                    ]):
+                        skipped_count += 1
+                        continue
+
+                    record_data = {
+                        "head_name": head_name,
+                        "head_labels": get_all_labels(head_label),
+                        "tail_name": tail_name,
+                        "tail_labels": get_all_labels(tail_label),
+                        "rel_type": relation.upper(),
+                        "rel_props": flatten_properties(rel.get('properties', {})) # <-- FLATTENING STEP
+                    }
+                    batch.append(record_data)
+
+                    if len(batch) >= batch_size:
+                        session.run(cypher_query, batch=batch)
+                        processed_count += len(batch)
+                        batch = []
                 
-                if triplets_batch:
-                    process_batch(session, triplets_batch)
-                    processed_count += len(triplets_batch)
+                if batch:
+                    session.run(cypher_query, batch=batch)
+                    processed_count += len(batch)
 
-        except FileNotFoundError:
-            print(f"ERROR: The file {GRAPH_JSON_PATH} was not found. Please run the extraction script first.")
-            driver.close()
-            return
-        except Exception as e:
-            print(f"An error occurred while reading the JSON file: {e}")
-            driver.close()
-            return
-
-    print(f"\n--- Population Complete ---")
-    print(f"Successfully processed and merged {processed_count} triplets into the database.")
-    driver.close()
-
-def process_batch(session, batch: list[dict]):
-    """
-    Processes a batch of triplets in a single transaction.
-    """
-    cypher_query = """
-    UNWIND $triplets AS triplet
-    
-    WITH triplet,
-         apoc.map.get($label_map, triplet.relation, null, false) AS labels
-    WHERE labels IS NOT NULL
-
-    CALL apoc.merge.node([labels.head], {name: triplet.head}) YIELD node AS headNode
-    
-    CALL apoc.merge.node([labels.tail], {name: triplet.tail}) YIELD node AS tailNode
-    
-    CALL apoc.merge.relationship(headNode, triplet.relation, {}, {}, tailNode) YIELD rel
-    
-    RETURN count(*)
-    """
-    
-    session.run(cypher_query, triplets=batch, label_map=RELATIONSHIP_TO_NODE_LABELS)
+    except Exception as e:
+        print(f"An error occurred during processing: {e}")
+    finally:
+        driver.close()
+        print("Database connection closed.")
+        print(f"\n--- Population Complete ---")
+        print(f"Total relationships successfully processed: {processed_count}")
+        print(f"Total malformed relationships skipped: {skipped_count}")
 
 if __name__ == "__main__":
-    main()
+    with GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)) as driver:
+        with driver.session(database="neo4j") as session:
+            print("Clearing existing database for a clean run...")
+            session.run("MATCH (n) DETACH DELETE n")
+            print("Database cleared.")
+    
+    populate_graph()
